@@ -255,13 +255,20 @@ def semantic_chunk_text(text, chunk_size = DEFAULT_CHUNK_SIZE, overlap_size = DE
         print(f"{i + 1}. {chunk}")
 
 def semantic_chunking(text, chunk_size = DEFAULT_CHUNK_SIZE, overlap_size = DEFAULT_OVERLAP_SIZE):
+    text = text.strip()
+    if not text:
+        return []
+
     sentences = re.split(r"(?<=[.!?])\s+", text)
-    chunks = []
     
+    if len(sentences) == 1 and not text.endswith((".", "!", "?")):
+        sentences = [text]
+
+    chunks = []
     i = 0
     while i < len(sentences) - overlap_size:
         chunk_sentences = sentences[i:i+chunk_size]
-        chunks.append(" ".join(chunk_sentences))
+        chunks.append(" ".join([sentence.strip() for sentence in chunk_sentences if sentence.strip()]))
         i += (chunk_size - overlap_size)
 
     return chunks
