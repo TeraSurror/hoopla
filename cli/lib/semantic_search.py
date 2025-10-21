@@ -1,12 +1,16 @@
+from calendar import c
+import chunk
+import json
 import os
+import re
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from .search_utils import EMBEDDING_PATH, load_movies
+from .search_utils import CACHE_PATH, CHUNK_EMBEDDING_PATH, CHUNK_METADATA_PATH, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP_SIZE, DEFAULT_SEARCH_LIMIT, DOCUMENT_PREVIEW_LENGTH, EMBEDDING_PATH, format_search_result, load_movies
 
 class SemanticSearch:
-    def __init__(self):
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+    def __init__(self, model="allMiniLM-L6-v2"):
+        self.model = SentenceTransformer(model)
         self.embeddings = None
         self.documents = None
         self.document_map = {}
@@ -71,6 +75,113 @@ class SemanticSearch:
 
         return result
 
+class ChunkedSemanticSearch(SemanticSearch):
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
+        super().__init__(model_name)
+        self.chunk_embeddings = None
+        self.chunk_metadata = None
+
+    def build_chunk_embeddings(self, documents):
+        self.documents = documents
+        self.document_map = {}
+
+        all_chunks = []
+        all_chunk_metadata = []
+        for idx, document in enumerate(self.documents):
+            doc_id = document["id"]
+            description = document.get("description", "")
+
+            self.document_map[doc_id] = document
+
+            if not description or not description.strip():
+                continue
+
+            chunks = semantic_chunking(description, 4, 1)
+            for i, chunk in enumerate(chunks):
+                all_chunks.append(chunk)
+                all_chunk_metadata.append({
+                    "movie_idx": idx,
+                    "chunk_idx": i,
+                    "total_chunks": len(chunks)
+                })
+        self.chunk_embeddings = self.model.encode(all_chunks, show_progress_bar=True)
+        self.chunk_metadata = all_chunk_metadata
+
+        os.makedirs(os.path.dirname(CHUNK_EMBEDDING_PATH), exist_ok=True)
+        np.save(CHUNK_EMBEDDING_PATH, self.chunk_embeddings)
+
+        with open(CHUNK_METADATA_PATH, 'w') as f:
+            json.dump({"chunks": all_chunk_metadata, "total_chunks": len(all_chunks)}, f, indent=2)
+
+        return self.chunk_embeddings
+
+    def load_or_create_chunk_embeddings(self, documents):
+        self.documents = documents
+        self.document_map = {}
+
+        for document in self.documents:
+            doc_id = document["id"]
+
+            self.document_map[doc_id] = document
+
+            if os.path.exists(CHUNK_EMBEDDING_PATH) and os.path.exists(CHUNK_METADATA_PATH):
+                self.chunk_embeddings = np.load(CHUNK_EMBEDDING_PATH, allow_pickle=True)
+                with open(CHUNK_METADATA_PATH, 'r') as f:
+                    data = json.load(f)
+                    self.chunk_metadata = data["chunks"]
+                
+                return self.chunk_embeddings
+
+        return self.build_chunk_embeddings(documents)
+
+    def search_chunks(self, query, limit):
+        if self.chunk_embeddings is None or self.chunk_metadata is None:
+            raise ValueError("No chunk embeddings are loaded. Call `load_or_create_chunk_embeddings` first.")
+
+        embeddings = self.generate_embedding(query)
+        chunk_scores = []
+
+        for idx, chunk_embedding in enumerate(self.chunk_embeddings):
+            similarity = cosine_similarity(embeddings, chunk_embedding)
+            chunk_scores.append({
+                "chunk_idx": idx,
+                "movie_idx": self.chunk_metadata[idx]["movie_idx"],
+                "score": similarity
+            })
+
+        movie_scores = {}
+        for chunk_score in chunk_scores:
+            movie_idx = chunk_score["movie_idx"]
+            if (
+                movie_idx not in movie_scores
+                or chunk_score["score"] > movie_scores[movie_idx]
+            ):
+                movie_scores[movie_idx] = chunk_score["score"]
+
+        sorted_movies = sorted(movie_scores.items(), key=lambda x:x[1], reverse=True)
+
+        results = []
+        for movie_idx, score in sorted_movies[:limit]:
+            doc = self.documents[movie_idx]
+            results.append(
+                format_search_result(
+                    doc_id=doc["id"],
+                    title=doc["title"],
+                    document=doc["description"][:DOCUMENT_PREVIEW_LENGTH],
+                    score=score
+                )
+            )
+        
+        return results
+
+
+def embed_chunks():
+    chunkedSemanticSearcher = ChunkedSemanticSearch()
+    movie_list = load_movies()
+    embeddings = chunkedSemanticSearcher.load_or_create_chunk_embeddings(movie_list)
+    print(f"Generated {len(embeddings)} chunked embeddings")
+
+
 def verify_model():
     semantic_search = SemanticSearch()
     print(f"Model loaded: {semantic_search.model}")
@@ -117,3 +228,47 @@ def search_movies(query, limit):
     for idx, movie in enumerate(movie_list):
         print(f"{idx + 1}. {movie["title"]} (score: {movie["score"]:.4f})")
         print(f"   {movie["description"][:100]}...")
+
+def chunk_text(text, chunk_size = DEFAULT_CHUNK_SIZE, overlap_size = DEFAULT_OVERLAP_SIZE):
+    chunks = fixed_size_chunking(text, chunk_size, overlap_size)
+    print(f"Chunking {len(text)} characters")
+
+    for i, chunk in enumerate(chunks):
+        print(f"{i + 1}. {chunk}")
+
+def fixed_size_chunking(text, chunk_size = DEFAULT_CHUNK_SIZE, overlap_size = DEFAULT_OVERLAP_SIZE):
+    words = text.split(" ")
+    chunks = []
+
+    i = 0
+    while i < len(words) - overlap_size:
+        chunk_words = words[i:i+chunk_size]
+        chunks.append(" ".join(chunk_words))
+        i += (chunk_size - overlap_size)
+
+    return chunks
+
+def semantic_chunk_text(text, chunk_size = DEFAULT_CHUNK_SIZE, overlap_size = DEFAULT_OVERLAP_SIZE):
+    chunks = semantic_chunking(text, chunk_size, overlap_size)
+    print(f"Semantically chunking {len(text)} characters")
+    for i, chunk in enumerate(chunks):
+        print(f"{i + 1}. {chunk}")
+
+def semantic_chunking(text, chunk_size = DEFAULT_CHUNK_SIZE, overlap_size = DEFAULT_OVERLAP_SIZE):
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks = []
+    
+    i = 0
+    while i < len(sentences) - overlap_size:
+        chunk_sentences = sentences[i:i+chunk_size]
+        chunks.append(" ".join(chunk_sentences))
+        i += (chunk_size - overlap_size)
+
+    return chunks
+
+def search_chunked_command(query, limit = DEFAULT_SEARCH_LIMIT):
+    movie_list = load_movies()
+    searcher = ChunkedSemanticSearch()
+    searcher.load_or_create_chunk_embeddings(movie_list)
+    results = searcher.search_chunks(query, limit)
+    return {"query": query, "results": results}
